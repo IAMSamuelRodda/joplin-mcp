@@ -9,16 +9,28 @@ Requirements:
     - Joplin desktop or CLI must be running with the Web Clipper service enabled
     - API runs on localhost:41184 by default
 
-Required environment variables:
-    JOPLIN_TOKEN: API token from Joplin's Web Clipper settings
+Environment variables:
+    JOPLIN_TOKEN: (Required) API token from Joplin's Web Clipper settings
     JOPLIN_PORT: (Optional) API port, defaults to 41184
+    JOPLIN_AUTO_LAUNCH: (Optional) Set to 'true' (default) to auto-launch Joplin
+                        desktop if not running. Set to 'false' to disable.
+                        On connection failure, will attempt to launch Joplin and
+                        retry once after a 2 second wait.
 """
 
+import asyncio
 import json
 import os
+import shutil
+import subprocess
+import time
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()  # Load .env file if present
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -30,6 +42,111 @@ mcp = FastMCP("joplin_mcp")
 # Constants
 DEFAULT_PORT = 41184
 CHARACTER_LIMIT = 25000
+AUTO_LAUNCH_ENABLED = os.environ.get("JOPLIN_AUTO_LAUNCH", "true").lower() == "true"
+LAUNCH_WAIT_SECONDS = 2.0
+MAX_LAUNCH_RETRIES = 1  # Only retry once to avoid masking other issues
+ENSURE_RUNNING_TIMEOUT = 15.0  # Max seconds to wait for Joplin to become ready
+ENSURE_RUNNING_POLL_INTERVAL = 1.0  # Seconds between API readiness checks
+
+
+# =============================================================================
+# Auto-Launch Utilities
+# =============================================================================
+
+
+def _is_joplin_running() -> bool:
+    """Check if Joplin desktop is running."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "joplin"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _launch_joplin() -> bool:
+    """
+    Attempt to launch Joplin desktop application.
+
+    Returns True if launch command was issued successfully.
+    """
+    # Try common Joplin executable locations
+    home = os.path.expanduser("~")
+    joplin_commands = [
+        f"{home}/.joplin/Joplin.AppImage",  # Default AppImage location
+        "joplin-desktop",  # Standard Linux package
+        "joplin",  # Alternative name
+        "/usr/bin/joplin-desktop",
+        "/usr/bin/joplin",
+        "/snap/bin/joplin-desktop",  # Snap package
+        "/opt/Joplin/joplin",  # Manual AppImage install
+    ]
+
+    # Also check for flatpak
+    flatpak_cmd = ["flatpak", "run", "net.cozic.joplin_desktop"]
+
+    for cmd in joplin_commands:
+        if shutil.which(cmd) or os.path.isfile(cmd):
+            try:
+                subprocess.Popen(
+                    [cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return True
+            except Exception:
+                continue
+
+    # Try flatpak as fallback
+    if shutil.which("flatpak"):
+        try:
+            subprocess.Popen(
+                flatpak_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception:
+            pass
+
+    return False
+
+
+async def _wait_for_joplin_api_ready(timeout: float = ENSURE_RUNNING_TIMEOUT) -> bool:
+    """
+    Poll until Joplin API is responsive.
+
+    Args:
+        timeout: Maximum seconds to wait for API readiness.
+
+    Returns:
+        True if API became ready, False if timeout exceeded.
+    """
+    port = os.environ.get("JOPLIN_PORT", DEFAULT_PORT)
+    token = os.environ.get("JOPLIN_TOKEN", "")
+    base_url = f"http://localhost:{port}"
+
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            async with httpx.AsyncClient() as client:
+                # Use /ping endpoint to check API readiness
+                resp = await client.get(
+                    f"{base_url}/ping",
+                    params={"token": token},
+                    timeout=2.0,
+                )
+                if resp.status_code == 200:
+                    return True
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            pass
+        await asyncio.sleep(ENSURE_RUNNING_POLL_INTERVAL)
+    return False
 
 
 # =============================================================================
@@ -266,8 +383,9 @@ async def _make_api_request(
     method: str = "GET",
     json_data: Optional[dict] = None,
     params: Optional[dict] = None,
+    _retry_count: int = 0,
 ) -> dict | list | None:
-    """Make request to Joplin API."""
+    """Make request to Joplin API with auto-launch retry."""
     base_url, token = _get_api_config()
 
     # Add token to params
@@ -275,19 +393,39 @@ async def _make_api_request(
         params = {}
     params["token"] = token
 
-    async with httpx.AsyncClient() as client:
-        response = await client.request(
-            method,
-            f"{base_url}/{endpoint}",
-            json=json_data,
-            params=params,
-            timeout=30.0,
-        )
-        response.raise_for_status()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.request(
+                method,
+                f"{base_url}/{endpoint}",
+                json=json_data,
+                params=params,
+                timeout=30.0,
+            )
+            response.raise_for_status()
 
-        if response.status_code == 204 or not response.content:
-            return None
-        return response.json()
+            if response.status_code == 204 or not response.content:
+                return None
+            return response.json()
+
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        # Auto-launch logic: only retry once
+        if AUTO_LAUNCH_ENABLED and _retry_count < MAX_LAUNCH_RETRIES:
+            if not _is_joplin_running():
+                launched = _launch_joplin()
+                if launched:
+                    # Wait for Joplin to start and enable Web Clipper
+                    await asyncio.sleep(LAUNCH_WAIT_SECONDS)
+                    # Retry the request once
+                    return await _make_api_request(
+                        endpoint,
+                        method,
+                        json_data,
+                        params,
+                        _retry_count=_retry_count + 1,
+                    )
+        # Re-raise if auto-launch disabled, already retried, or launch failed
+        raise
 
 
 async def _get_all_paginated(
@@ -333,11 +471,17 @@ def _handle_error(e: Exception) -> str:
     error_str = str(e).lower()
 
     if "connection refused" in error_str or "connect" in error_str:
+        auto_launch_note = ""
+        if AUTO_LAUNCH_ENABLED:
+            auto_launch_note = "\n\nNote: Auto-launch was attempted but Joplin may not have started in time."
+        else:
+            auto_launch_note = "\n\nTip: Set JOPLIN_AUTO_LAUNCH=true to auto-start Joplin."
+
         return (
             "Error: Cannot connect to Joplin. Make sure:\n"
             "1. Joplin desktop is running\n"
             "2. Web Clipper service is enabled (Tools → Options → Web Clipper)\n"
-            "3. The API port matches JOPLIN_PORT (default: 41184)"
+            f"3. The API port matches JOPLIN_PORT (default: 41184){auto_launch_note}"
         )
     elif "401" in error_str or "unauthorized" in error_str or "forbidden" in error_str:
         return "Error: Invalid API token. Check JOPLIN_TOKEN is correct."
@@ -367,6 +511,68 @@ def _truncate_response(result: str, item_count: int) -> str:
         truncated += f"\n\n---\n**Response truncated** ({item_count} items). Use filters to narrow results."
         return truncated
     return result
+
+
+# =============================================================================
+# System Tools
+# =============================================================================
+
+
+@mcp.tool(
+    name="joplin_ensure_running",
+    annotations={
+        "title": "Ensure Joplin is Running",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def joplin_ensure_running() -> str:
+    """
+    Ensure Joplin desktop is running and API is ready.
+
+    Use this tool proactively before performing Joplin operations to avoid
+    cold-start delays. If Joplin is already running, returns immediately.
+    If not running, launches Joplin and waits for the API to become ready.
+
+    This is useful for:
+    - Pre-warming Joplin at the start of a session
+    - Ensuring Joplin is available before batch operations
+    - Integration with lazy-mcp preloading
+
+    Returns:
+        Status message: 'already_running', 'launched', or error details.
+    """
+    # Check if already running and API responsive
+    if _is_joplin_running():
+        # Verify API is actually ready (Web Clipper enabled)
+        if await _wait_for_joplin_api_ready(timeout=2.0):
+            return "✅ Joplin is already running and API is ready."
+
+    # Not running or API not ready - attempt launch
+    if not AUTO_LAUNCH_ENABLED:
+        return (
+            "❌ Joplin is not running and auto-launch is disabled. "
+            "Please start Joplin manually and enable Web Clipper."
+        )
+
+    launched = _launch_joplin()
+    if not launched:
+        return (
+            "❌ Failed to launch Joplin. Could not find Joplin executable. "
+            "Please start Joplin manually."
+        )
+
+    # Wait for API to become ready
+    if await _wait_for_joplin_api_ready():
+        return "✅ Joplin launched successfully and API is ready."
+
+    return (
+        "⚠️ Joplin was launched but API did not become ready within "
+        f"{ENSURE_RUNNING_TIMEOUT} seconds. Please check that Web Clipper "
+        "is enabled in Joplin (Tools → Options → Web Clipper)."
+    )
 
 
 # =============================================================================
