@@ -45,7 +45,7 @@ CHARACTER_LIMIT = 25000
 AUTO_LAUNCH_ENABLED = os.environ.get("JOPLIN_AUTO_LAUNCH", "true").lower() == "true"
 LAUNCH_WAIT_SECONDS = 2.0
 MAX_LAUNCH_RETRIES = 1  # Only retry once to avoid masking other issues
-ENSURE_RUNNING_TIMEOUT = 15.0  # Max seconds to wait for Joplin to become ready
+ENSURE_RUNNING_TIMEOUT = 25.0  # Max seconds to wait for Joplin to become ready (AppImage can be slow)
 ENSURE_RUNNING_POLL_INTERVAL = 1.0  # Seconds between API readiness checks
 
 
@@ -88,6 +88,14 @@ def _launch_joplin() -> bool:
     # Also check for flatpak
     flatpak_cmd = ["flatpak", "run", "net.cozic.joplin_desktop"]
 
+    # Build environment with DISPLAY for GUI apps on Linux
+    env = os.environ.copy()
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"  # Default X11 display
+    # Also set WAYLAND_DISPLAY if available for Wayland systems
+    if "WAYLAND_DISPLAY" not in env and os.path.exists("/run/user/1000/wayland-0"):
+        env["WAYLAND_DISPLAY"] = "wayland-0"
+
     for cmd in joplin_commands:
         if shutil.which(cmd) or os.path.isfile(cmd):
             try:
@@ -96,6 +104,7 @@ def _launch_joplin() -> bool:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
+                    env=env,
                 )
                 return True
             except Exception:
@@ -109,6 +118,7 @@ def _launch_joplin() -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=env,
             )
             return True
         except Exception:
