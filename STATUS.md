@@ -3,9 +3,9 @@
 > **Purpose**: Current work, active bugs, and recent changes (2-week rolling window)
 > **Lifecycle**: Living (update daily/weekly during active development)
 
-**Last Updated**: 2025-11-26
-**Current Phase**: Bug Fix & Architecture Review
-**Version**: 0.1.0
+**Last Updated**: 2025-11-30
+**Current Phase**: Lazy-MCP Optimization
+**Version**: 0.2.0
 
 ---
 
@@ -25,13 +25,14 @@
 
 ## Current Focus
 
-**Completed Today:**
-- ✅ Fixed `note_count` field bug causing 500 errors (line 403)
-- ✅ Investigated Joplin Server API feasibility
-- ✅ Evaluated joppy library for server support
+**Completed Today (2025-11-30):**
+- ✅ Optimized all 11 tool descriptions for lazy-mcp discovery
+- ✅ Fixed duplicate notebook creation (now checks for existing before creating)
+- ✅ Updated improving-mcps skill with lazy-mcp integration guidance
 
-**In Progress:**
-- 🔵 Restart Claude Code to reload fixed MCP server
+**Previous:**
+- ✅ Fixed `note_count` field bug causing 500 errors
+- ✅ Added `ensure_running` tool for pre-warming
 
 **Next Up:**
 - [ ] Add automated tests
@@ -60,6 +61,13 @@
 ---
 
 ## Recent Achievements (Last 2 Weeks)
+
+**Lazy-MCP Optimization v0.2.0** ✅
+- Completed: 2025-11-30
+- Front-loaded all 11 tool descriptions for truncated discovery views
+- Added duplicate notebook prevention (case-insensitive title check)
+- Tool descriptions now action-first, no redundant "in Joplin" phrases
+- Improved create_notebook to return existing notebook if found
 
 **Initial MCP Server Implementation** ✅
 - Completed: 2025-11-26
@@ -103,6 +111,29 @@
 1. **Restart Claude Code** to reload fixed MCP server
 2. **Add basic test suite** - pytest with mocked API responses
 3. **Consider CLAUDE.md** - navigation hub for AI agents
+
+---
+
+## Future Improvements
+
+### Remote MCP Access (mcp.joplin.rodda.xyz)
+**Status:** Deferred
+**Priority:** Low
+
+Expose MCP server over HTTPS for cloud AI integration (Claude.ai, ChatGPT, etc.).
+
+**Requirements:**
+- HTTP/SSE transport layer (MCP currently uses stdio)
+- Authentication layer (API keys or OAuth)
+- HTTPS reverse proxy
+- Wait for Claude.ai/ChatGPT to support remote MCP connections
+
+**Architecture:**
+```
+mcp.joplin.rodda.xyz → Auth + HTTPS → HTTP/SSE Bridge → Joplin MCP → Joplin Desktop API
+```
+
+**Proof of Concept:** Test with Zero (pip) agent by Arc Forge first.
 
 ---
 

@@ -540,16 +540,10 @@ def _truncate_response(result: str, item_count: int) -> str:
 )
 async def joplin_ensure_running() -> str:
     """
-    Ensure Joplin desktop is running and API is ready.
+    Ensure API ready. Launches Joplin if needed, waits for connection.
 
-    Use this tool proactively before performing Joplin operations to avoid
-    cold-start delays. If Joplin is already running, returns immediately.
-    If not running, launches Joplin and waits for the API to become ready.
-
-    This is useful for:
-    - Pre-warming Joplin at the start of a session
-    - Ensuring Joplin is available before batch operations
-    - Integration with lazy-mcp preloading
+    Use proactively before batch operations to avoid cold-start delays.
+    Returns immediately if already running. Useful for session pre-warming.
 
     Returns:
         Status message: 'already_running', 'launched', or error details.
@@ -602,9 +596,10 @@ async def joplin_ensure_running() -> str:
 )
 async def joplin_list_notebooks(params: ListNotebooksInput) -> str:
     """
-    List all notebooks (folders) in Joplin.
+    List notebooks with IDs and hierarchy. Use to find notebook_id for filtering.
 
-    Returns the notebook hierarchy with IDs needed for other operations.
+    Returns tree structure showing parent/child relationships.
+    Always list notebooks first before creating new ones to avoid duplicates.
 
     Args:
         params: ListNotebooksInput containing:
@@ -657,7 +652,10 @@ async def joplin_list_notebooks(params: ListNotebooksInput) -> str:
 )
 async def joplin_create_notebook(params: CreateNotebookInput) -> str:
     """
-    Create a new notebook (folder) in Joplin.
+    Create notebook or return existing. Checks for duplicates by title first.
+
+    ⚠️ IMPORTANT: Always searches for existing notebook with same title before
+    creating. Returns existing notebook ID if found to prevent duplicates.
 
     Args:
         params: CreateNotebookInput containing:
@@ -665,9 +663,27 @@ async def joplin_create_notebook(params: CreateNotebookInput) -> str:
             - parent_id: Optional parent notebook for sub-notebook
 
     Returns:
-        Created notebook details with ID.
+        Notebook details with ID (existing or newly created).
     """
     try:
+        # First, check if notebook with same title already exists
+        existing_notebooks = await _get_all_paginated(
+            "folders",
+            params={"fields": "id,title,parent_id"},
+        )
+
+        # Search for exact title match (case-insensitive) at the same parent level
+        target_parent = params.parent_id or ""
+        for nb in existing_notebooks:
+            nb_parent = nb.get("parent_id", "") or ""
+            if (nb.get("title", "").lower() == params.title.lower()
+                    and nb_parent == target_parent):
+                return (
+                    f"📁 Notebook **{nb['title']}** already exists "
+                    f"(ID: `{nb['id']}`). Using existing notebook."
+                )
+
+        # No duplicate found, create new notebook
         data: dict[str, Any] = {"title": params.title}
         if params.parent_id:
             data["parent_id"] = params.parent_id
@@ -697,14 +713,17 @@ async def joplin_create_notebook(params: CreateNotebookInput) -> str:
 )
 async def joplin_list_notes(params: ListNotesInput) -> str:
     """
-    List notes from Joplin, optionally filtered by notebook.
+    List notes with IDs, titles, dates. Filter by notebook_id, sort by date/title.
+
+    Returns note metadata (not content). Use get_note for full content.
+    Supports to-do status indicators in output.
 
     Args:
         params: ListNotesInput containing:
             - notebook_id: Filter by notebook (optional)
-            - limit: Maximum notes to return
-            - order_by: Sort field
-            - order_desc: Sort descending
+            - limit: Maximum notes to return (default 50)
+            - order_by: Sort field (updated_time, created_time, title)
+            - order_desc: Sort descending (default true)
             - response_format: 'markdown' or 'json'
 
     Returns:
@@ -763,12 +782,15 @@ async def joplin_list_notes(params: ListNotesInput) -> str:
 )
 async def joplin_get_note(params: GetNoteInput) -> str:
     """
-    Get full details of a specific note.
+    Get note by ID with full Markdown content. Includes metadata and body.
+
+    Use after list_notes or search_notes to retrieve full content.
+    Set include_body=false for metadata only.
 
     Args:
         params: GetNoteInput containing:
-            - note_id: The note ID
-            - include_body: Whether to include full content
+            - note_id: The note ID (required)
+            - include_body: Include full content (default true)
             - response_format: 'markdown' or 'json'
 
     Returns:
@@ -825,17 +847,18 @@ async def joplin_get_note(params: GetNoteInput) -> str:
 )
 async def joplin_create_note(params: CreateNoteInput) -> str:
     """
-    Create a new note in Joplin.
+    Create note with Markdown body, optional tags, to-do support.
 
-    Supports Markdown formatting in the body. Can also create to-do items.
+    Specify notebook_id to target specific notebook (list notebooks first).
+    Tags are created automatically if they don't exist.
 
     Args:
         params: CreateNoteInput containing:
-            - title: Note title
-            - body: Note content in Markdown
-            - notebook_id: Target notebook (optional)
-            - tags: List of tag names (optional)
-            - is_todo: Create as to-do item
+            - title: Note title (required)
+            - body: Markdown content (default empty)
+            - notebook_id: Target notebook ID (uses default if not set)
+            - tags: List of tag names (auto-created if needed)
+            - is_todo: Create as to-do item (default false)
 
     Returns:
         Created note details with ID.
@@ -907,18 +930,19 @@ async def joplin_create_note(params: CreateNoteInput) -> str:
 )
 async def joplin_update_note(params: UpdateNoteInput) -> str:
     """
-    Update an existing note in Joplin.
+    Update note title, body, or move to different notebook. Partial updates OK.
 
-    Only provided fields will be updated.
+    Only provided fields are changed. Can convert to/from to-do,
+    mark complete, or move between notebooks.
 
     Args:
         params: UpdateNoteInput containing:
-            - note_id: The note ID to update
+            - note_id: The note ID to update (required)
             - title: New title (optional)
-            - body: New content (optional)
+            - body: New Markdown content (optional)
             - notebook_id: Move to different notebook (optional)
             - is_todo: Convert to/from to-do (optional)
-            - todo_completed: Mark completed (optional)
+            - todo_completed: Mark to-do complete (optional)
 
     Returns:
         Confirmation that the note was updated.
@@ -965,13 +989,11 @@ async def joplin_update_note(params: UpdateNoteInput) -> str:
 )
 async def joplin_delete_note(params: DeleteNoteInput) -> str:
     """
-    Delete a note from Joplin.
-
-    ⚠️ This action cannot be undone.
+    ⚠️ Delete note permanently. Cannot be undone.
 
     Args:
         params: DeleteNoteInput containing:
-            - note_id: The note ID to delete
+            - note_id: The note ID to delete (required)
 
     Returns:
         Confirmation that the note was deleted.
@@ -996,23 +1018,15 @@ async def joplin_delete_note(params: DeleteNoteInput) -> str:
 )
 async def joplin_search_notes(params: SearchNotesInput) -> str:
     """
-    Search notes in Joplin using query syntax.
+    Search notes. Supports title:, body:, tag:, notebook:, type: prefixes.
 
-    Query prefixes supported:
-    - title: (search in title)
-    - body: (search in body)
-    - tag: (filter by tag)
-    - notebook: (filter by notebook)
-    - created: / updated: (date filters)
-    - type:todo / type:note (filter by type)
-    - iscompleted:1/0 (for todos)
-
-    Example: "tag:work type:todo" finds all work-tagged todos.
+    Examples: "tag:work type:todo", "title:meeting", "notebook:Projects".
+    Also supports created:, updated: date filters and iscompleted:1/0.
 
     Args:
         params: SearchNotesInput containing:
-            - query: Search query
-            - limit: Maximum results
+            - query: Search query with optional prefixes
+            - limit: Maximum results (default 20)
             - response_format: 'markdown' or 'json'
 
     Returns:
@@ -1078,7 +1092,9 @@ async def joplin_search_notes(params: SearchNotesInput) -> str:
 )
 async def joplin_list_tags(params: ListTagsInput) -> str:
     """
-    List all tags in Joplin.
+    List all tags with IDs. Use for tag: search prefix or tag_note operations.
+
+    Returns alphabetically sorted list. Tags are reusable across notes.
 
     Args:
         params: ListTagsInput containing:
@@ -1122,12 +1138,14 @@ async def joplin_list_tags(params: ListTagsInput) -> str:
 )
 async def joplin_tag_note(params: TagNoteInput) -> str:
     """
-    Add a tag to a note. Creates the tag if it doesn't exist.
+    Add tag to note. Creates tag automatically if it doesn't exist.
+
+    Idempotent: adding existing tag has no effect. Case-insensitive matching.
 
     Args:
         params: TagNoteInput containing:
-            - note_id: The note ID to tag
-            - tag: Tag name to add
+            - note_id: The note ID to tag (required)
+            - tag: Tag name to add (auto-created if needed)
 
     Returns:
         Confirmation that the tag was added.
